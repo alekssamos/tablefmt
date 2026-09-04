@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 # Установка tablefmt как команды. Запуск: bash install.sh
 set -euo pipefail
-cd "$(dirname "$0")"
+REPO="alekssamos/tablefmt"
+BRANCH="main"
+RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 
 BIN_DIR="${HOME}/.local/bin"
 mkdir -p "$BIN_DIR"
 
-cp tablefmt "$BIN_DIR/tablefmt"
+# Источник скрипта: локальный файл при запуске из клона, иначе скачивание.
+if [[ -f "$(dirname "$0")/tablefmt" ]]; then
+    src="$(dirname "$0")/tablefmt"
+else
+    src="$(mktemp)"
+    trap 'rm -f "$src"' EXIT
+    echo "Скачивание tablefmt…"
+    curl -LsSf "${RAW}/tablefmt" -o "$src"
+fi
+
+cp "$src" "$BIN_DIR/tablefmt"
 chmod +x "$BIN_DIR/tablefmt"
 
 # Добавляем в PATH, если ещё нет.
