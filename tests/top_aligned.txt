@@ -1,0 +1,5 @@
+  PID USER      PR  NI     VIRT      RES      SHR S  %CPU  %MEM     TIME+ COMMAND
+    1 root      20   0   168320    11392     8192 S   0.0   0.1   0:01.23 systemd
+  512 root      20   0   123456    23456     1234 R  12.5   2.3   2:03.45 python3 top.py
+  999 daemon    20   0    10240      512      256 S   0.0   0.0   0:00.00 [kworker/0:0]
+23456 alexey    20   0   310000    98000    45000 S   4.2   0.9  10:00.00 ssh -R 8080:local

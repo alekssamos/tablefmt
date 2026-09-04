@@ -1,0 +1,3 @@
+NAME AGE CITY
+Ivan 30 Moscow
+Anna 25 Paris

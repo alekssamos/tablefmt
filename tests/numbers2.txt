@@ -1,0 +1,3 @@
+NAME       VALUE
+foo        20 000
+bar        100 500

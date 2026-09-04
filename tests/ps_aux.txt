@@ -1,0 +1,5 @@
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.0  168320 11392 pts/0    Ssl  08:37   0:01 bash
+alexey       512 12.5  2.3 1234567 23456 pts/1    R+   09:00  10:00 python3 server.py
+mysql        999  0.3  1.1  890000  43000 ?        Ssl  06:00   5:30 /usr/sbin/mysqld
+www-data     1234  0.0  0.2  450000  8000 ?        Ss   Jul20  20:45 nginx: worker process

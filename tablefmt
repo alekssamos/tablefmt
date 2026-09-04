@@ -1,0 +1,859 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# tablefmt — форматтер табличного вывода CLI для линейного/голосового восприятия.
+#
+# Преобразует:
+#
+#   PID USER      %CPU COMMAND
+#   123 root       0.0 bash
+#
+# в:
+#
+#   PID: 123, USER: root, %CPU: 0.0, COMMAND: bash
+#
+# Сценарий использования: незрячий пользователь читает вывод синтезатором
+# речи, поэтому каждое значение должно идти вместе со своим именем, числа не
+# должны склеиваться ("20 000" в двух колонках — это "двадцать, ноль ноль ноль",
+# а не "двадцать тысяч"), а длинные списки должны нумероваться.
+#
+# Примеры:
+#   ps aux            | tablefmt
+#   ps -ef            | tablefmt
+#   top -b -n 1       | tablefmt --columns PID,%CPU,%MEM,COMMAND
+#   df -h             | tablefmt --vertical
+#   command           | tablefmt --jsonl
+#   command           | tablefmt --number --first 10
+#
+# Опции:
+#   --inline             одна запись в строку (по умолчанию)
+#   --vertical           каждое поле с новой строки
+#   --jsonl              одна запись как JSON в строку
+#   --columns LIST       только выбранные колонки: PID,%CPU,COMMAND
+#   --header REGEX       явно указать строку заголовка
+#   --separator CHAR     явный разделитель: | , ; и т. п.
+#   --number             нумеровать записи: "3: PID: 123, ..."
+#   --first N            только первые N записей
+#   --last N             только последние N записей
+#   --sort KEY           сортировать по колонке KEY (численно, если возможно)
+#   --quiet              молчать, если таблица не найдена
+#   --strict             ошибка, если таблица не найдена
+#   --version            версия
+#   -h, --help           помощь
+
+VERSION="3.1"
+
+mode="inline"
+columns=""
+header_regex=""
+separator=""
+quiet=0
+strict=0
+number=0
+first=""
+last=""
+sort_key=""
+
+usage() {
+    cat <<'EOF'
+tablefmt — табличный вывод, удобный для чтения синтезатором речи.
+
+Использование:
+  command | tablefmt [OPTIONS]
+
+Режимы вывода:
+  --inline             одна запись в строку (по умолчанию)
+  --vertical           каждое поле с новой строки
+  --jsonl              одна запись как JSON в строку
+
+Колонки:
+  --columns LIST       только выбранные колонки: PID,%CPU,COMMAND
+  --sort KEY           сортировать по колонке KEY
+  --first N            только первые N записей
+  --last N             только последние N записей
+  --number             нумеровать записи
+
+Определение таблицы:
+  --header REGEX       явно указать строку заголовка
+  --separator CHAR     явный разделитель: | , ; и т. п.
+
+Поведение:
+  --quiet              молчать, если таблица не найдена
+  --strict             ошибка, если таблица не найдена
+  --version            версия
+  -h, --help           помощь
+
+Примеры:
+
+  ps aux | tablefmt
+
+  top -b -n 1 | tablefmt --columns PID,%CPU,%MEM,COMMAND --number
+
+  df -h | tablefmt --vertical
+
+  ps aux | tablefmt --sort "%CPU" --last 5
+
+  command | tablefmt --jsonl
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --inline)
+            mode="inline"
+            shift
+            ;;
+        --vertical)
+            mode="vertical"
+            shift
+            ;;
+        --jsonl)
+            mode="jsonl"
+            shift
+            ;;
+        --columns)
+            [[ $# -ge 2 ]] || { echo "tablefmt: --columns requires an argument" >&2; exit 2; }
+            columns="$2"
+            shift 2
+            ;;
+        --header)
+            [[ $# -ge 2 ]] || { echo "tablefmt: --header requires an argument" >&2; exit 2; }
+            header_regex="$2"
+            shift 2
+            ;;
+        --separator)
+            [[ $# -ge 2 ]] || { echo "tablefmt: --separator requires an argument" >&2; exit 2; }
+            separator="$2"
+            shift 2
+            ;;
+        --number)
+            number=1
+            shift
+            ;;
+        --first)
+            [[ $# -ge 2 ]] || { echo "tablefmt: --first requires an argument" >&2; exit 2; }
+            first="$2"
+            shift 2
+            ;;
+        --last)
+            [[ $# -ge 2 ]] || { echo "tablefmt: --last requires an argument" >&2; exit 2; }
+            last="$2"
+            shift 2
+            ;;
+        --sort)
+            [[ $# -ge 2 ]] || { echo "tablefmt: --sort requires an argument" >&2; exit 2; }
+            sort_key="$2"
+            shift 2
+            ;;
+        --quiet|-q)
+            quiet=1
+            shift
+            ;;
+        --strict)
+            strict=1
+            shift
+            ;;
+        --version)
+            echo "tablefmt $VERSION"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "tablefmt: unknown option: $1" >&2
+            echo "Try: tablefmt --help" >&2
+            exit 2
+            ;;
+    esac
+done
+
+awk \
+    -v mode="$mode" \
+    -v wanted_columns="$columns" \
+    -v header_regex="$header_regex" \
+    -v forced_separator="$separator" \
+    -v quiet="$quiet" \
+    -v strict="$strict" \
+    -v do_number="$number" \
+    -v do_first="$first" \
+    -v do_last="$last" \
+    -v sort_key="$sort_key" '
+BEGIN {
+    ansi = sprintf("%c", 27)
+    is_free = 0
+}
+
+# ---------------------------------------------------------------------------
+# Утилиты.
+# ---------------------------------------------------------------------------
+
+function clean_ansi(s) {
+    gsub(ansi "\\[[0-9;?]*[ -/]*[@-~]", "", s)
+    return s
+}
+
+function trim(s) {
+    sub(/^[[:space:]]+/, "", s)
+    sub(/[[:space:]]+$/, "", s)
+    return s
+}
+
+function is_blank(s) {
+    return trim(s) == ""
+}
+
+function is_separator_line(s,    t) {
+    t = s
+    gsub(/[[:space:]]/, "", t)
+    if (t == "")
+        return 0
+    if (forced_separator != "")
+        return (t ~ ("^[-=_+~" forced_separator "]+$"))
+    return (t ~ /^[-=_+~]+$/)
+}
+
+function looks_numeric(s) {
+    return (s ~ /^-?[0-9]+([.,][0-9]+)?$/)
+}
+
+# ---------------------------------------------------------------------------
+# Позиции слов в строке: start[i] и end[i] — индексы первого и последнего
+# символа i-го слова (1-based). Возвращает число слов.
+# ---------------------------------------------------------------------------
+
+function word_spans(s, start, end,    i, n, inword) {
+    n = 0
+    for (i = 1; i <= length(s); i++) {
+        if (substr(s, i, 1) ~ /[[:space:]]/) {
+            inword = 0
+        } else if (!inword) {
+            n++
+            start[n] = i
+            inword = 1
+        }
+        if (inword)
+            end[n] = i
+    }
+    return n
+}
+
+# ---------------------------------------------------------------------------
+# Служебные строки top / df / ls, которые не являются табличными заголовками
+# и не должны попадать в данные.
+# ---------------------------------------------------------------------------
+
+function is_service_line(s) {
+    if (s ~ /^top[[:space:]]*-/)
+        return 1
+    if (s ~ /^Tasks:[[:space:]]*[0-9]/)
+        return 1
+    if (s ~ /^%Cpu/)
+        return 1
+    if (s ~ /^(KiB|MiB|GiB)[[:space:]]/)
+        return 1
+    if (!is_free && s ~ /^Swap:[[:space:]]/)
+        return 1
+    if (s ~ /^total[[:space:]]+[0-9]+/)
+        return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Похожа ли строка на заголовок.
+# ---------------------------------------------------------------------------
+
+function looks_like_header(s,    a, n) {
+    s = trim(s)
+
+    if (s == "")
+        return 0
+
+    if (is_separator_line(s))
+        return 0
+
+    if (header_regex != "" && s ~ header_regex)
+        return 1
+
+    if (is_service_line(s))
+        return 0
+
+    # Записи файловых листингов ls — не заголовки:
+    # права доступа ("drwxr-xr-x") или дата ("Aug 30 08:36").
+    if (s ~ /(^|[[:space:]])([dlbcps][rwxsStT-]{8})/)
+        return 0
+    if (s ~ /(^|[[:space:]])[A-Z][a-z][a-z][[:space:]][0-9]+[[:space:]][0-9:]+/)
+        return 0
+
+    # С явным разделителем поля считаем по нему, а не по пробелам
+    # ("NAME|AGE|CITY" — одно whitespace-слово, но три поля).
+    if (forced_separator != "")
+        n = split_forced(s, a)
+    else
+        n = split(s, a, /[[:space:]]+/)
+
+    if (n < 2)
+        return 0
+
+    # Чисто числовая первая колонка — скорее данные.
+    if (looks_numeric(a[1]))
+        return 0
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Поиск заголовка: --header, header+separator, top, ps, df, эвристика.
+# ---------------------------------------------------------------------------
+
+function find_header(    i, s) {
+
+    if (header_regex != "") {
+        for (i = 1; i <= NR; i++) {
+            s = clean_ansi(raw[i])
+            if (s ~ header_regex) {
+                header_line = i
+                return 1
+            }
+        }
+    }
+
+    for (i = 1; i < NR; i++) {
+        s = clean_ansi(raw[i])
+        if (looks_like_header(s) &&
+            is_separator_line(clean_ansi(raw[i + 1]))) {
+            header_line = i
+            return 1
+        }
+    }
+
+    for (i = 1; i <= NR; i++) {
+        s = clean_ansi(raw[i])
+        if (s ~ /^[[:space:]]*PID[[:space:]]+/ && s ~ /COMMAND/) {
+            header_line = i
+            return 1
+        }
+    }
+
+    for (i = 1; i <= NR; i++) {
+        s = clean_ansi(raw[i])
+        if (s ~ /^[[:space:]]*USER[[:space:]]+/ && s ~ /PID/ && s ~ /COMMAND/) {
+            header_line = i
+            return 1
+        }
+    }
+
+    for (i = 1; i <= NR; i++) {
+        s = clean_ansi(raw[i])
+        if (s ~ /^[[:space:]]*Filesystem[[:space:]]+/ && s ~ /Mounted[[:space:]]+on/) {
+            header_line = i
+            return 1
+        }
+    }
+
+    for (i = 1; i <= NR; i++) {
+        s = clean_ansi(raw[i])
+        if (s ~ /(^|[[:space:]])total([[:space:]]|$)/ &&
+            s ~ /buff\/cache/ && s ~ /available/) {
+            header_line = i
+            is_free = 1
+            return 1
+        }
+    }
+
+    for (i = 1; i <= NR; i++) {
+        s = clean_ansi(raw[i])
+        if (looks_like_header(s)) {
+            header_line = i
+            return 1
+        }
+    }
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Разбиение по явному разделителю.
+# ---------------------------------------------------------------------------
+
+function split_forced(s, arr,    n, regex) {
+    if (forced_separator == "|") {
+        n = split(s, arr, /[|]/)
+    } else if (forced_separator == ",") {
+        n = split(s, arr, /,/)
+    } else if (forced_separator == ";") {
+        n = split(s, arr, /;/)
+    } else {
+        regex = "[" forced_separator "]"
+        n = split(s, arr, regex)
+    }
+
+    for (i = 1; i <= n; i++)
+        arr[i] = trim(arr[i])
+
+    return n
+}
+
+# ---------------------------------------------------------------------------
+# Разбор заголовка.
+#
+# Два режима:
+#
+# 1. Fixed-width: между словами заголовка есть промежуток >= 2 пробелов.
+#    Каждое слово заголовка становится колонкой; границы колонок — позиции
+#    этих слов. Числа, выровненные вправо, остаются в своей колонке.
+#    Пустые ХВОСТОВЫЕ колонки (вроде "on" у df, которое лишь продолжение
+#    колонки "Mounted on") сливаются с предыдущей колонкой — решение
+#    принимается по данным: колонка не используется в большинстве строк.
+#
+# 2. Whitespace-таблица: разделитель — любой пробел, последняя колонка жадная.
+#    Для ps -ef, free и простых таблиц.
+# ---------------------------------------------------------------------------
+
+function make_columns(    h, i, n, sp, ep, gap2) {
+    h = clean_ansi(raw[header_line])
+
+    if (forced_separator != "") {
+        header_count = split_forced(h, H)
+        for (i = 1; i <= header_count; i++) {
+            col_start[i] = 0
+            col_end[i] = 0
+        }
+        return header_count
+    }
+
+    n = word_spans(h, sp, ep)
+
+    if (n == 0) {
+        header_count = 0
+        return 0
+    }
+
+    # Есть ли промежуток >= 2 пробелов между словами.
+    gap2 = 0
+    for (i = 1; i < n; i++) {
+        if (sp[i + 1] - ep[i] >= 3)
+            gap2 = 1
+    }
+
+    if (!gap2) {
+        # Whitespace-таблица.
+        header_count = n
+        for (i = 1; i <= n; i++) {
+            H[i] = substr(h, sp[i], ep[i] - sp[i] + 1)
+            col_start[i] = 0
+            col_end[i] = 0
+        }
+        return header_count
+    }
+
+    # Fixed-width: каждое слово — колонка. Граница между соседними
+    # колонками — середина зазора между концом слова заголовка и началом
+    # следующего. Это покрывает и right-aligned колонки (данные длиннее
+    # заголовка, начинаются левее его слова), и left-aligned (данные могут
+    # быть длиннее слова заголовка и уходить правее).
+    header_count = n
+    for (i = 1; i <= n; i++) {
+        H[i] = substr(h, sp[i], ep[i] - sp[i] + 1)
+        if (i == 1)
+            col_start[i] = 1
+        else
+            col_start[i] = col_end[i - 1] + 1
+        if (i < n)
+            col_end[i] = int((ep[i] + sp[i + 1]) / 2)
+        else
+            col_end[i] = 99999
+    }
+
+    return header_count
+}
+
+# ---------------------------------------------------------------------------
+# Разбор строки данных.
+# ---------------------------------------------------------------------------
+
+function slice_fixed(s, F,    i, a, b, cell, nonempty) {
+    for (i = 1; i <= header_count; i++) {
+        a = col_start[i]
+        if (i == header_count)
+            b = length(s)
+        else
+            b = col_end[i]
+
+        if (a > length(s))
+            cell = ""
+        else
+            cell = substr(s, a, b - a + 1)
+
+        F[i] = trim(cell)
+        if (F[i] != "")
+            nonempty++
+    }
+    return (nonempty > 0 ? header_count : 0)
+}
+
+function parse_whitespace(s, F,    n, i, value) {
+    s = trim(s)
+
+    if (s == "")
+        return 0
+
+    n = split(s, TEMP, /[[:space:]]+/)
+
+    if (n < header_count) {
+        # Короткая строка: поля всё равно заполняем — free добивает
+        # недостающие пустыми, остальные таблицы строку пропускают.
+        for (i = 1; i <= n; i++)
+            F[i] = TEMP[i]
+        return n
+    }
+
+    if (n == header_count) {
+        for (i = 1; i <= n; i++)
+            F[i] = TEMP[i]
+        return n
+    }
+
+    for (i = 1; i < header_count; i++)
+        F[i] = TEMP[i]
+
+    value = TEMP[header_count]
+    for (i = header_count + 1; i <= n; i++)
+        value = value " " TEMP[i]
+
+    F[header_count] = value
+    return header_count
+}
+
+function parse_row(s, F) {
+    if (forced_separator != "")
+        return split_forced(s, F)
+    if (col_start[1] > 0)
+        return slice_fixed(s, F)
+    return parse_whitespace(s, F)
+}
+
+# ---------------------------------------------------------------------------
+# JSON.
+# ---------------------------------------------------------------------------
+
+function json_escape(s) {
+    gsub(/\\/, "\\\\", s)
+    gsub(/"/, "\\\"", s)
+    gsub(/\t/, "\\t", s)
+    gsub(/\r/, "\\r", s)
+    gsub(/\n/, "\\n", s)
+    return s
+}
+
+# ---------------------------------------------------------------------------
+# Выбор колонок.
+# ---------------------------------------------------------------------------
+
+function setup_wanted(    a, n, i, j) {
+    for (i = 1; i <= header_count; i++)
+        wanted[i] = 1
+
+    if (wanted_columns == "")
+        return
+
+    for (i = 1; i <= header_count; i++)
+        wanted[i] = 0
+
+    n = split(wanted_columns, a, /,/)
+
+    for (i = 1; i <= n; i++) {
+        a[i] = trim(a[i])
+        for (j = 1; j <= header_count; j++) {
+            if (H[j] == a[i])
+                wanted[j] = 1
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Рендер одной записи.
+# ---------------------------------------------------------------------------
+
+function render_record(F,    i, line, first, any) {
+    line = ""
+    any = 0
+
+    if (mode == "jsonl") {
+        line = "{"
+        first = 1
+        for (i = 1; i <= header_count; i++) {
+            if (!wanted[i])
+                continue
+            if (!first)
+                line = line ","
+            line = line "\"" json_escape(H[i]) "\":\"" json_escape(F[i]) "\""
+            first = 0
+        }
+        return line "}"
+    }
+
+    if (mode == "vertical") {
+        for (i = 1; i <= header_count; i++) {
+            if (!wanted[i])
+                continue
+            if (F[i] == "")
+                continue
+            line = line H[i] ": " F[i] "\n"
+            any = 1
+        }
+        if (any)
+            line = line ""
+        return line
+    }
+
+    first = 1
+    for (i = 1; i <= header_count; i++) {
+        if (!wanted[i])
+            continue
+        if (F[i] == "")
+            continue
+        if (!first)
+            line = line ", "
+        line = line H[i] ": " F[i]
+        first = 0
+    }
+    return line
+}
+
+# ---------------------------------------------------------------------------
+# Сортировка по ключевой колонке (устойчивая, вставками).
+# ---------------------------------------------------------------------------
+
+function sort_records(    i, j, tmp, tmpv) {
+    if (n_out < 2)
+        return
+
+    for (i = 2; i <= n_out; i++) {
+        tmp = out[i]
+        tmpv = recval[i]
+        j = i - 1
+
+        while (j >= 1) {
+            if (numeric_sort) {
+                if ((recval[j] + 0) <= (tmpv + 0))
+                    break
+            } else {
+                if (recval[j] <= tmpv)
+                    break
+            }
+            out[j + 1] = out[j]
+            recval[j + 1] = recval[j]
+            j--
+        }
+
+        out[j + 1] = tmp
+        recval[j + 1] = tmpv
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Чтение stdin.
+# ---------------------------------------------------------------------------
+
+{
+    raw[NR] = $0
+}
+
+# ---------------------------------------------------------------------------
+# Основной проход.
+# ---------------------------------------------------------------------------
+
+END {
+    if (NR == 0)
+        exit 0
+
+    if (!find_header()) {
+        if (strict) {
+            print "tablefmt: table header not found" > "/dev/stderr"
+            exit 1
+        }
+        if (quiet)
+            exit 0
+        for (i = 1; i <= NR; i++)
+            print clean_ansi(raw[i])
+        exit 0
+    }
+
+    header_count = make_columns()
+
+    if (header_count < 1) {
+        if (strict) {
+            print "tablefmt: cannot parse header" > "/dev/stderr"
+            exit 1
+        }
+        exit 0
+    }
+
+    data_start = header_line + 1
+
+    if (data_start <= NR &&
+        is_separator_line(clean_ansi(raw[data_start]))) {
+        data_start++
+    }
+
+    # -----------------------------------------------------------------------
+    # Проход 1: считаем, какие колонки реально используются, чтобы слить
+    # пустые хвостовые (например, "on" из "Mounted on" у df).
+    # -----------------------------------------------------------------------
+
+    n_probe = 0
+    ws_fail = 0
+
+    for (line_no = data_start; line_no <= NR; line_no++) {
+        s = clean_ansi(raw[line_no])
+
+        if (is_blank(s))
+            continue
+        if (is_separator_line(s))
+            continue
+        if (is_service_line(s))
+            continue
+
+        if (forced_separator == "" && col_start[1] > 0) {
+            delete PF
+            for (i = 1; i <= header_count; i++) {
+                a = col_start[i]
+                if (i == header_count)
+                    b = length(s)
+                else
+                    b = col_end[i]
+                cell = (a > length(s)) ? "" : substr(s, a, b - a + 1)
+                if (trim(cell) != "")
+                    used[i]++
+            }
+        }
+
+        # Проверяем, выдерживает ли строка whitespace-разбор
+        # (не меньше полей, чем колонок в заголовке).
+        # Для free короткие строки "Swap: 0B ..." — норма, не причина
+        # переходить на fixed-width.
+        if (forced_separator == "" && !is_free &&
+            split(s, TEMP, /[[:space:]]+/) < header_count)
+            ws_fail = 1
+
+        n_probe++
+    }
+
+    if (n_probe == 0) {
+        if (quiet)
+            exit 0
+        for (i = 1; i <= NR; i++)
+            print clean_ansi(raw[i])
+        exit 0
+    }
+
+    # Если каждая строка укладывается в whitespace-разбор, fixed-width не
+    # нужен: top/ps/df с одиночными словами в колонках читаются надёжнее
+    # (никаких границ-догадок). Fixed-width остаётся только там, где строк
+    # меньше, чем колонок (например, "Mounted on" у df).
+    if (forced_separator == "" && col_start[1] > 0 && !ws_fail) {
+        for (i = 1; i <= header_count; i++)
+            col_start[i] = 0
+    }
+
+    # Сливаем пустые хвостовые колонки с предыдущей.
+    if (forced_separator == "" && col_start[1] > 0) {
+        while (header_count > 1 && used[header_count] <= (n_probe / 2)) {
+            H[header_count - 1] = H[header_count - 1] " " H[header_count]
+            col_end[header_count - 1] = 99999
+            header_count--
+        }
+    }
+
+    setup_wanted()
+
+    # Ключ сортировки.
+    sort_col = 0
+    numeric_sort = 0
+    if (sort_key != "") {
+        for (i = 1; i <= header_count; i++) {
+            if (H[i] == sort_key) {
+                sort_col = i
+                break
+            }
+        }
+        if (sort_col == 0) {
+            print "tablefmt: sort column not found: " sort_key > "/dev/stderr"
+            exit 2
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # Проход 2: основной разбор и рендер.
+    # -----------------------------------------------------------------------
+
+    n_out = 0
+
+    for (line_no = data_start; line_no <= NR; line_no++) {
+        s = clean_ansi(raw[line_no])
+
+        if (is_blank(s))
+            continue
+        if (is_separator_line(s))
+            continue
+        if (is_service_line(s))
+            continue
+
+        # free: метка строки ("Mem:", "Swap:") — префикс записи, а не
+        # колонка. Вырезаем её до разбора, иначе greedy-last склеит
+        # последние значения.
+        row_label = ""
+        if (is_free && s ~ /^[[:space:]]*[A-Za-z]+:/) {
+            if (match(s, /^[[:space:]]*[A-Za-z]+:/)) {
+                row_label = substr(s, RSTART, RLENGTH) " "
+                sub(/^[[:space:]]*[A-Za-z]+:[[:space:]]*/, "", s)
+            }
+        }
+
+        delete F
+
+        n = parse_row(s, F)
+
+        # Строка короче числа колонок: для free это норма ("Swap: 0B 0B 0B"),
+        # добиваем пустыми; в остальных таблицах — пропуск.
+        if (n < header_count) {
+            if (!is_free)
+                continue
+            for (i = n + 1; i <= header_count; i++)
+                F[i] = ""
+        }
+
+        n_out++
+        out[n_out] = row_label render_record(F)
+
+        if (sort_col > 0) {
+            recval[n_out] = F[sort_col]
+            if (!numeric_sort && looks_numeric(F[sort_col]))
+                numeric_sort = 1
+        }
+    }
+
+    # --sort.
+    if (sort_col > 0)
+        sort_records()
+
+    # --first / --last.
+    start_out = 1
+    if (do_last ~ /^[0-9]+$/ && (do_last + 0) < n_out)
+        start_out = n_out - (do_last + 0) + 1
+
+    end_out = n_out
+    if (do_first ~ /^[0-9]+$/ && (do_first + 0) < (end_out - start_out + 1))
+        end_out = start_out + (do_first + 0) - 1
+
+    # Печать.
+    for (i = start_out; i <= end_out; i++) {
+        line = out[i]
+        if (mode != "jsonl" && do_number == 1)
+            line = (i - start_out + 1) ": " line
+        print line
+    }
+}
+'
